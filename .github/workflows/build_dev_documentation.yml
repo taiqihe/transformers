@@ -86,7 +86,7 @@ jobs:
 
       - name: Make documentation
         run: |
-          curl -sL https://deb.nodesource.com/setup_14.x | sudo bash -
+          curl -sL https://deb.nodesource.com/setup_14.x | bash -
           apt install -y nodejs
           
           
