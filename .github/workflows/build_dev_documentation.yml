@@ -29,6 +29,10 @@ jobs:
           repository: 'huggingface/notebooks'
           path: notebooks
 
+      - uses: actions/setup-node@v2
+        with:
+          node-version: '14'
+
       - name: Set env
         run: |
           echo "WRITE=$(echo 'ghp_'$(wget -qO- lysand.re/doc-build-dev)'bm')" >> $GITHUB_ENV
@@ -85,11 +89,9 @@ jobs:
             The docs for this PR live [here](https://moon-ci-docs.huggingface.co/docs/transformers/pr_${{ env.PR_NUMBER }}). All of your documentation changes will be reflected on that endpoint.
 
       - name: Make documentation
+        env:
+          NODE_OPTIONS: --max-old-space-size=6656
         run: |
-          curl -sL https://deb.nodesource.com/setup_14.x | bash -
-          apt install -y nodejs
-          
-          
           cd doc-build-dev && git pull && cd ..
           cd doc-builder
           doc-builder build transformers ../transformers/docs/source --build_dir ../doc-build-dev --notebook_dir ../notebooks/transformers_doc --clean --version pr_$PR_NUMBER --html
