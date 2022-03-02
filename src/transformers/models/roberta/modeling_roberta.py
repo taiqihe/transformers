@@ -199,6 +199,7 @@ class RobertaSelfAttention(nn.Module):
         encoder_attention_mask=None,
         past_key_value=None,
         output_attentions=False,
+        output_qk=False,
     ):
         mixed_query_layer = self.query(hidden_states)
 
@@ -278,10 +279,15 @@ class RobertaSelfAttention(nn.Module):
         new_context_layer_shape = context_layer.size()[:-2] + (self.all_head_size,)
         context_layer = context_layer.view(new_context_layer_shape)
 
-        outputs = (context_layer, attention_probs) if output_attentions else (context_layer,)
+        outputs = (context_layer,)
+        if output_attentions:
+            outputs = outputs + (attention_probs,)
+        if output_qk:
+            outputs = outputs + ((query_layer, key_layer),)
 
         if self.is_decoder:
             outputs = outputs + (past_key_value,)
+
         return outputs
 
 
@@ -335,6 +341,7 @@ class RobertaAttention(nn.Module):
         encoder_attention_mask=None,
         past_key_value=None,
         output_attentions=False,
+        output_qk=False,
     ):
         self_outputs = self.self(
             hidden_states,
@@ -344,6 +351,7 @@ class RobertaAttention(nn.Module):
             encoder_attention_mask,
             past_key_value,
             output_attentions,
+            output_qk,
         )
         attention_output = self.output(self_outputs[0], hidden_states)
         outputs = (attention_output,) + self_outputs[1:]  # add attentions if we output them
@@ -406,6 +414,7 @@ class RobertaLayer(nn.Module):
         encoder_attention_mask=None,
         past_key_value=None,
         output_attentions=False,
+        output_qk=False,
     ):
         # decoder uni-directional self-attention cached key/values tuple is at positions 1,2
         self_attn_past_key_value = past_key_value[:2] if past_key_value is not None else None
@@ -415,6 +424,7 @@ class RobertaLayer(nn.Module):
             head_mask,
             output_attentions=output_attentions,
             past_key_value=self_attn_past_key_value,
+            output_qk=output_qk,
         )
         attention_output = self_attention_outputs[0]
 
@@ -442,6 +452,7 @@ class RobertaLayer(nn.Module):
                 encoder_attention_mask,
                 cross_attn_past_key_value,
                 output_attentions,
+                output_qk,
             )
             attention_output = cross_attention_outputs[0]
             outputs = outputs + cross_attention_outputs[1:-1]  # add cross attentions if we output attention weights
@@ -487,10 +498,12 @@ class RobertaEncoder(nn.Module):
         output_attentions=False,
         output_hidden_states=False,
         return_dict=True,
+        output_qk=False,
     ):
         all_hidden_states = () if output_hidden_states else None
         all_self_attentions = () if output_attentions else None
         all_cross_attentions = () if output_attentions and self.config.add_cross_attention else None
+        all_qk_vecs = () if output_qk else None
 
         next_decoder_cache = () if use_cache else None
         for i, layer_module in enumerate(self.layer):
@@ -510,7 +523,7 @@ class RobertaEncoder(nn.Module):
 
                 def create_custom_forward(module):
                     def custom_forward(*inputs):
-                        return module(*inputs, past_key_value, output_attentions)
+                        return module(*inputs, past_key_value, output_attentions, output_qk)
 
                     return custom_forward
 
@@ -531,6 +544,7 @@ class RobertaEncoder(nn.Module):
                     encoder_attention_mask,
                     past_key_value,
                     output_attentions,
+                    output_qk,
                 )
 
             hidden_states = layer_outputs[0]
@@ -540,6 +554,9 @@ class RobertaEncoder(nn.Module):
                 all_self_attentions = all_self_attentions + (layer_outputs[1],)
                 if self.config.add_cross_attention:
                     all_cross_attentions = all_cross_attentions + (layer_outputs[2],)
+            if output_qk:
+                idx = 2 if output_attentions else 1
+                all_qk_vecs = all_qk_vecs + (layer_outputs[idx],)
 
         if output_hidden_states:
             all_hidden_states = all_hidden_states + (hidden_states,)
@@ -562,6 +579,7 @@ class RobertaEncoder(nn.Module):
             hidden_states=all_hidden_states,
             attentions=all_self_attentions,
             cross_attentions=all_cross_attentions,
+            qk_vecs=all_qk_vecs,
         )
 
 
@@ -758,6 +776,7 @@ class RobertaModel(RobertaPreTrainedModel):
         past_key_values=None,
         use_cache=None,
         output_attentions=None,
+        output_qk=None,
         output_hidden_states=None,
         return_dict=None,
     ):
@@ -782,6 +801,7 @@ class RobertaModel(RobertaPreTrainedModel):
             `past_key_values`).
         """
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_qk = output_qk if output_qk is not None else False
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
@@ -856,6 +876,7 @@ class RobertaModel(RobertaPreTrainedModel):
             past_key_values=past_key_values,
             use_cache=use_cache,
             output_attentions=output_attentions,
+            output_qk=output_qk,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
         )
@@ -872,6 +893,7 @@ class RobertaModel(RobertaPreTrainedModel):
             hidden_states=encoder_outputs.hidden_states,
             attentions=encoder_outputs.attentions,
             cross_attentions=encoder_outputs.cross_attentions,
+            qk_vecs=encoder_outputs.qk_vecs,
         )
 
 
@@ -1079,6 +1101,7 @@ class RobertaForMaskedLM(RobertaPreTrainedModel):
         encoder_attention_mask=None,
         labels=None,
         output_attentions=None,
+        output_qk=None,
         output_hidden_states=None,
         return_dict=None,
     ):
@@ -1102,6 +1125,7 @@ class RobertaForMaskedLM(RobertaPreTrainedModel):
             encoder_hidden_states=encoder_hidden_states,
             encoder_attention_mask=encoder_attention_mask,
             output_attentions=output_attentions,
+            output_qk=output_qk,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
         )
@@ -1122,6 +1146,7 @@ class RobertaForMaskedLM(RobertaPreTrainedModel):
             logits=prediction_scores,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
+            qk_vecs=outputs.qk_vecs,
         )
 
 

@@ -197,6 +197,7 @@ class BaseModelOutputWithPoolingAndCrossAttentions(ModelOutput):
     past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
     attentions: Optional[Tuple[torch.FloatTensor]] = None
     cross_attentions: Optional[Tuple[torch.FloatTensor]] = None
+    qk_vecs: Optional[Tuple[torch.FloatTensor]] = None
 
 
 @dataclass
@@ -243,6 +244,7 @@ class BaseModelOutputWithPastAndCrossAttentions(ModelOutput):
     hidden_states: Optional[Tuple[torch.FloatTensor]] = None
     attentions: Optional[Tuple[torch.FloatTensor]] = None
     cross_attentions: Optional[Tuple[torch.FloatTensor]] = None
+    qk_vecs: Optional[Tuple[torch.FloatTensor]] = None
 
 
 @dataclass
@@ -478,6 +480,7 @@ class MaskedLMOutput(ModelOutput):
     logits: torch.FloatTensor = None
     hidden_states: Optional[Tuple[torch.FloatTensor]] = None
     attentions: Optional[Tuple[torch.FloatTensor]] = None
+    qk_vecs: Optional[Tuple[torch.FloatTensor]] = None
 
 
 @dataclass
