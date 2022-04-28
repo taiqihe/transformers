@@ -72,6 +72,7 @@ class EncoderDecoderMixin:
         enc_dec_model.eval()
 
         self.assertTrue(enc_dec_model.config.is_encoder_decoder)
+        self.assertFalse(enc_dec_model.config.tie_word_embeddings)
 
         outputs_encoder_decoder = enc_dec_model(
             input_values=input_values,
@@ -346,7 +347,8 @@ class EncoderDecoderMixin:
         enc_dec_model.to(torch_device)
 
         # make sure EOS token is set to None to prevent early stopping of generation
-        enc_dec_model.config.eos_token_id = None
+        if hasattr(enc_dec_model.config, "eos_token_id"):
+            enc_dec_model.config.eos_token_id = None
         if hasattr(enc_dec_model.config, "decoder") and hasattr(enc_dec_model.config.decoder, "eos_token_id"):
             enc_dec_model.config.decoder.eos_token_id = None
 
