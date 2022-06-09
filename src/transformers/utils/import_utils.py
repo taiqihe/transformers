@@ -282,25 +282,33 @@ def is_torch_bf16_available():
     # some bits come from https://github.com/pytorch/pytorch/blob/2289a12f21c54da93bf5d696e3f9aea83dd9c10d/torch/testing/_internal/common_cuda.py#L51
     # with additional check for torch version
     # to succeed:
-    # 1. the hardware needs to support bf16 (arch >= Ampere)
-    # 2. torch >= 1.10 (1.9 should be enough for AMP API has changed in 1.10, so using 1.10 as minimal)
-    # 3. CUDA >= 11
+    # 1. torch >= 1.10 (1.9 should be enough for AMP API has changed in 1.10, so using 1.10 as minimal)
+    # 2. the hardware needs to support bf16 (GPU arch >= Ampere, or CPU)
+    # 3. if using gpu, CUDA >= 11
     # 4. torch.autocast exists
     # XXX: one problem here is that it may give invalid results on mixed gpus setup, so it's
     # really only correct for the 0th gpu (or currently set default device if different from 0)
-
-    if not torch.cuda.is_available() or torch.version.cuda is None:
-        return False
-    if torch.cuda.get_device_properties(torch.cuda.current_device()).major < 8:
-        return False
-    if int(torch.version.cuda.split(".")[0]) < 11:
-        return False
+    is_torch_gpu_bf16_available = True
+    is_torch_cpu_bf16_available = True
     if version.parse(torch.__version__) < version.parse("1.10"):
-        return False
-    if not hasattr(torch, "autocast"):
-        return False
+        is_torch_gpu_bf16_available = False
+        is_torch_cpu_bf16_available = False
 
-    return True
+    if torch.cuda.is_available() and torch.version.cuda is not None:
+        if torch.cuda.get_device_properties(torch.cuda.current_device()).major < 8:
+            is_torch_gpu_bf16_available = False
+        if int(torch.version.cuda.split(".")[0]) < 11:
+            is_torch_gpu_bf16_available = False
+        if not hasattr(torch.cuda.amp, "autocast"):
+            is_torch_gpu_bf16_available = False
+    else:
+        is_torch_gpu_bf16_available = False
+
+    # checking CPU
+    if not hasattr(torch.cpu.amp, "autocast"):
+        is_torch_cpu_bf16_available = False
+
+    return is_torch_cpu_bf16_available or is_torch_gpu_bf16_available
 
 
 def is_torch_tf32_available():
@@ -325,7 +333,7 @@ torch_version = None
 _torch_fx_available = _torch_onnx_dict_inputs_support_available = False
 if _torch_available:
     torch_version = version.parse(importlib_metadata.version("torch"))
-    _torch_fx_available = (torch_version.major, torch_version.minor) == (
+    _torch_fx_available = (torch_version.major, torch_version.minor) >= (
         TORCH_FX_REQUIRED_VERSION.major,
         TORCH_FX_REQUIRED_VERSION.minor,
     )
@@ -376,6 +384,10 @@ def is_torch_tpu_available():
     return importlib.util.find_spec("torch_xla.core.xla_model") is not None
 
 
+def is_torchdynamo_available():
+    return importlib.util.find_spec("torchdynamo") is not None
+
+
 def is_datasets_available():
     return _datasets_available
 
@@ -398,6 +410,10 @@ def is_py3nvml_available():
 
 def is_apex_available():
     return importlib.util.find_spec("apex") is not None
+
+
+def is_ipex_available():
+    return importlib.util.find_spec("intel_extension_for_pytorch") is not None
 
 
 def is_bitsandbytes_available():
@@ -428,6 +444,10 @@ def is_protobuf_available():
     return importlib.util.find_spec("google.protobuf") is not None
 
 
+def is_accelerate_available():
+    return importlib.util.find_spec("accelerate") is not None
+
+
 def is_tokenizers_available():
     return importlib.util.find_spec("tokenizers") is not None
 
@@ -452,6 +472,8 @@ def is_in_notebook():
             raise ImportError("console")
         if "VSCODE_PID" in os.environ:
             raise ImportError("vscode")
+        if "DATABRICKS_RUNTIME_VERSION" in os.environ:
+            raise ImportError("databricks")
 
         return importlib.util.find_spec("IPython") is not None
     except (AttributeError, ImportError, KeyError):
@@ -725,6 +747,12 @@ PYCTCDECODE_IMPORT_ERROR = """
 `pip install pyctcdecode`
 """
 
+# docstyle-ignore
+ACCELERATE_IMPORT_ERROR = """
+{0} requires the accelerate library but it was not found in your environment. You can install it with pip:
+`pip install accelerate`
+"""
+
 
 BACKENDS_MAPPING = OrderedDict(
     [
@@ -750,6 +778,7 @@ BACKENDS_MAPPING = OrderedDict(
         ("torch", (is_torch_available, PYTORCH_IMPORT_ERROR)),
         ("vision", (is_vision_available, VISION_IMPORT_ERROR)),
         ("scipy", (is_scipy_available, SCIPY_IMPORT_ERROR)),
+        ("accelerate", (is_accelerate_available, ACCELERATE_IMPORT_ERROR)),
     ]
 )
 
@@ -861,8 +890,13 @@ class _LazyModule(ModuleType):
             return importlib.import_module("." + module_name, self.__name__)
         except Exception as e:
             raise RuntimeError(
-                f"Failed to import {self.__name__}.{module_name} because of the following error (look up to see its traceback):\n{e}"
+                f"Failed to import {self.__name__}.{module_name} because of the following error (look up to see its"
+                f" traceback):\n{e}"
             ) from e
 
     def __reduce__(self):
         return (self.__class__, (self._name, self.__file__, self._import_structure))
+
+
+class OptionalDependencyNotAvailable(BaseException):
+    """Internally used error class for signalling an optional dependency was not found."""

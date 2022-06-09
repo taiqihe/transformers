@@ -25,6 +25,8 @@ import unittest.mock as mock
 from importlib import import_module
 from typing import List, Tuple
 
+from datasets import Dataset
+
 from huggingface_hub import delete_repo, login
 from requests.exceptions import HTTPError
 from transformers import is_tf_available, is_torch_available
@@ -505,7 +507,8 @@ class TFModelTesterMixin:
             self.assertLessEqual(max_diff, tol, f"{name}: Difference between torch and tf is {max_diff} (>= {tol}).")
         else:
             raise ValueError(
-                f"`tf_outputs` should be an instance of `tf.Tensor`, a `tuple`, or an instance of `tf.Tensor`. Got {type(tf_outputs)} instead."
+                "`tf_outputs` should be an instance of `tf.Tensor`, a `tuple`, or an instance of `tf.Tensor`. Got"
+                f" {type(tf_outputs)} instead."
             )
 
     def prepare_pt_inputs_from_tf_inputs(self, tf_inputs_dict):
@@ -956,7 +959,10 @@ class TFModelTesterMixin:
                 else:
                     self.assertTrue(
                         all(tf.equal(tuple_object, dict_object)),
-                        msg=f"Tuple and dict output are not equal. Difference: {tf.math.reduce_max(tf.abs(tuple_object - dict_object))}",
+                        msg=(
+                            "Tuple and dict output are not equal. Difference:"
+                            f" {tf.math.reduce_max(tf.abs(tuple_object - dict_object))}"
+                        ),
                     )
 
                 recursive_check(tuple_output, dict_output)
@@ -972,9 +978,10 @@ class TFModelTesterMixin:
             dict_inputs = self._prepare_for_class(inputs_dict, model_class)
             check_equivalence(model, tuple_inputs, dict_inputs, {"output_hidden_states": True})
 
-            tuple_inputs = self._prepare_for_class(inputs_dict, model_class)
-            dict_inputs = self._prepare_for_class(inputs_dict, model_class)
-            check_equivalence(model, tuple_inputs, dict_inputs, {"output_attentions": True})
+            if self.has_attentions:
+                tuple_inputs = self._prepare_for_class(inputs_dict, model_class)
+                dict_inputs = self._prepare_for_class(inputs_dict, model_class)
+                check_equivalence(model, tuple_inputs, dict_inputs, {"output_attentions": True})
 
             # Not all models accept "labels" in the forward pass (yet :) )
             if "labels" in inspect.signature(model.call).parameters.keys():
@@ -986,15 +993,16 @@ class TFModelTesterMixin:
                 dict_inputs = self._prepare_for_class(inputs_dict, model_class, return_labels=True)
                 check_equivalence(model, tuple_inputs, dict_inputs, {"output_hidden_states": True})
 
-                tuple_inputs = self._prepare_for_class(inputs_dict, model_class, return_labels=True)
-                dict_inputs = self._prepare_for_class(inputs_dict, model_class, return_labels=True)
-                check_equivalence(model, tuple_inputs, dict_inputs, {"output_attentions": True})
+                if self.has_attentions:
+                    tuple_inputs = self._prepare_for_class(inputs_dict, model_class, return_labels=True)
+                    dict_inputs = self._prepare_for_class(inputs_dict, model_class, return_labels=True)
+                    check_equivalence(model, tuple_inputs, dict_inputs, {"output_attentions": True})
 
-                tuple_inputs = self._prepare_for_class(inputs_dict, model_class, return_labels=True)
-                dict_inputs = self._prepare_for_class(inputs_dict, model_class, return_labels=True)
-                check_equivalence(
-                    model, tuple_inputs, dict_inputs, {"output_hidden_states": True, "output_attentions": True}
-                )
+                    tuple_inputs = self._prepare_for_class(inputs_dict, model_class, return_labels=True)
+                    dict_inputs = self._prepare_for_class(inputs_dict, model_class, return_labels=True)
+                    check_equivalence(
+                        model, tuple_inputs, dict_inputs, {"output_hidden_states": True, "output_attentions": True}
+                    )
 
     def test_inputs_embeds(self):
         config, inputs_dict = self.model_tester.prepare_config_and_inputs_for_common()
@@ -1351,7 +1359,25 @@ class TFModelTesterMixin:
                 labels = {key: val for key, val in prepared_for_class.items() if key in label_names}
                 inputs_minus_labels = {key: val for key, val in prepared_for_class.items() if key not in label_names}
                 self.assertGreater(len(inputs_minus_labels), 0)
-                model.compile(optimizer=tf.keras.optimizers.SGD(0.0), run_eagerly=True)
+                accuracy_classes = [
+                    "ForPreTraining",
+                    "ForCausalLM",
+                    "ForMaskedLM",
+                    "ForQuestionAnswering",
+                    "ForMultipleChoice",
+                    "ForSequenceClassification",
+                    "ForTokenClassification",
+                    "ForNextSentencePrediction",
+                    "LMHeadModel",
+                ]
+                for accuracy_class in accuracy_classes:
+                    if model.__class__.__name__.endswith(accuracy_class):
+                        metrics = [tf.keras.metrics.SparseCategoricalAccuracy()]
+                        break
+                else:
+                    metrics = []
+
+                model.compile(optimizer=tf.keras.optimizers.SGD(0.0), run_eagerly=True, metrics=metrics)
                 # Make sure the model fits without crashing regardless of where we pass the labels
                 history1 = model.fit(
                     prepared_for_class,
@@ -1361,6 +1387,7 @@ class TFModelTesterMixin:
                     shuffle=False,
                 )
                 val_loss1 = history1.history["val_loss"][0]
+                accuracy1 = {key: val[0] for key, val in history1.history.items() if key.endswith("accuracy")}
                 history2 = model.fit(
                     inputs_minus_labels,
                     labels,
@@ -1370,7 +1397,52 @@ class TFModelTesterMixin:
                     shuffle=False,
                 )
                 val_loss2 = history2.history["val_loss"][0]
+                accuracy2 = {key: val[0] for key, val in history1.history.items() if key.endswith("accuracy")}
                 self.assertTrue(np.allclose(val_loss1, val_loss2, atol=1e-2, rtol=1e-3))
+                self.assertEqual(history1.history.keys(), history2.history.keys())
+                for key in history1.history.keys():
+                    if not key.startswith("val_"):
+                        self.assertTrue("val_" + key in history1.history.keys(), "Outputs differ in train/test step!")
+                if metrics:
+                    self.assertTrue(len(accuracy1) == len(accuracy2) > 0, "Missing metrics!")
+
+                # Make sure fit works with tf.data.Dataset and results are consistent
+                dataset = tf.data.Dataset.from_tensor_slices(prepared_for_class)
+                # Pass in all samples as a batch to match other `fit` calls
+                dataset = dataset.batch(len(dataset))
+                history3 = model.fit(
+                    dataset,
+                    validation_data=dataset,
+                    steps_per_epoch=1,
+                    validation_steps=1,
+                    shuffle=False,
+                )
+                val_loss3 = history3.history["val_loss"][0]
+                accuracy3 = {key: val[0] for key, val in history3.history.items() if key.endswith("accuracy")}
+                self.assertTrue(np.allclose(val_loss1, val_loss3, atol=1e-2, rtol=1e-3))
+                self.assertEqual(history1.history.keys(), history3.history.keys())
+                if metrics:
+                    self.assertTrue(len(accuracy1) == len(accuracy3) > 0, "Missing metrics!")
+
+    def test_int64_inputs(self):
+        config, inputs_dict = self.model_tester.prepare_config_and_inputs_for_common()
+        for model_class in self.all_model_classes:
+            prepared_for_class = self._prepare_for_class(
+                inputs_dict.copy(),
+                model_class,
+                return_labels=True if "labels" in inspect.signature(model_class.call).parameters.keys() else False,
+            )
+            if not any(
+                [tensor.dtype.is_integer for tensor in prepared_for_class.values() if isinstance(tensor, tf.Tensor)]
+            ):
+                return  # No integer inputs means no need for this test
+
+            prepared_for_class = {
+                key: tf.cast(tensor, tf.int64) if isinstance(tensor, tf.Tensor) and tensor.dtype.is_integer else tensor
+                for key, tensor in prepared_for_class.items()
+            }
+            model = model_class(config)
+            model(**prepared_for_class)  # No assertion, we're just checking this doesn't throw an error
 
     def test_generate_with_headmasking(self):
         attention_names = ["encoder_attentions", "decoder_attentions", "cross_attentions"]
@@ -1458,6 +1530,56 @@ class TFModelTesterMixin:
             # The main input is the name of the argument after `self`
             observed_main_input_name = list(model_signature.parameters.keys())[1]
             self.assertEqual(model_class.main_input_name, observed_main_input_name)
+
+    def test_dataset_conversion(self):
+        config, inputs_dict = self.model_tester.prepare_config_and_inputs_for_common()
+        for model_class in self.all_model_classes:
+            model = model_class(config)
+            tf_inputs_dict = self._prepare_for_class(inputs_dict, model_class, return_labels=False)
+            tf_inputs_dict = {
+                key: val
+                for key, val in tf_inputs_dict.items()
+                if "head_mask" not in key and isinstance(val, tf.Tensor)
+            }
+            tf_inputs_dict["extra_unwanted_column"] = list(tf_inputs_dict.values())[0]  # Use a random other tensor
+            input_dataset = Dataset.from_dict(tf_inputs_dict)
+            tf_dataset = model.prepare_tf_dataset(
+                input_dataset, batch_size=len(input_dataset), drop_remainder=False, shuffle=False
+            )
+            test_batch = next(iter(tf_dataset))
+            if isinstance(test_batch, tf.Tensor):
+                self.assertEqual(len(test_batch), len(input_dataset))  # Assert we didn't lose any data
+            else:
+                # Assert we discarded the unwanted extra column but kept everything else
+                self.assertEqual(len(test_batch), len(input_dataset.features) - 1)
+                self.assertNotIn("extra_unwanted_column", test_batch)
+                for tensor in test_batch.values():
+                    self.assertTrue(isinstance(tensor, tf.Tensor))
+                    self.assertEqual(len(tensor), len(input_dataset))  # Assert we didn't lose any data
+                    model(test_batch, training=False)
+
+            if "labels" in inspect.signature(model_class.call).parameters.keys():
+                tf_inputs_dict = self._prepare_for_class(inputs_dict, model_class, return_labels=True)
+                if "labels" not in tf_inputs_dict:
+                    return  # This model isn't giving us labels after all, don't try training with it
+                tf_inputs_dict = {key: val for key, val in tf_inputs_dict.items() if "head_mask" not in key}
+                tf_inputs_dict["extra_unwanted_column"] = list(tf_inputs_dict.values())[0]  # Use a random other tensor
+                input_dataset = Dataset.from_dict(tf_inputs_dict)
+                tf_dataset = model.prepare_tf_dataset(
+                    input_dataset, batch_size=len(input_dataset), drop_remainder=False, shuffle=False
+                )
+                test_batch, test_batch_labels = next(iter(tf_dataset))
+                self.assertGreater(len(test_batch_labels), 0)  # Assert the labels are present
+                feature_columns = 1 if isinstance(test_batch, tf.Tensor) else len(test_batch)
+                label_columns = 1 if isinstance(test_batch_labels, tf.Tensor) else len(test_batch_labels)
+                # Assert we discarded the unwanted extra column but kept everything else
+                self.assertEqual(feature_columns + label_columns, len(input_dataset.features) - 1)
+                if isinstance(test_batch, dict):
+                    self.assertNotIn("extra_unwanted_column", test_batch)
+                if isinstance(test_batch_labels, dict):
+                    self.assertNotIn("extra_unwanted_column", test_batch_labels)
+                model.compile(optimizer="sgd", run_eagerly=True)
+                model.train_on_batch(test_batch, test_batch_labels)
 
     def _generate_random_bad_tokens(self, num_bad_tokens, model):
         # special tokens cannot be bad tokens

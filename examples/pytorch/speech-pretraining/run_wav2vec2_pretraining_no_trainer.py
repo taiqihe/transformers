@@ -43,7 +43,7 @@ from transformers import (
     set_seed,
 )
 from transformers.models.wav2vec2.modeling_wav2vec2 import _compute_mask_indices, _sample_negative_indices
-from transformers.utils import get_full_repo_name
+from transformers.utils import get_full_repo_name, send_example_telemetry
 
 
 logger = get_logger(__name__)
@@ -219,7 +219,10 @@ def parse_args():
         "--pad_to_multiple_of",
         type=int,
         default=None,
-        help="If set will pad the sequence to a multiple of the provided value. This is especially useful to enable the use of Tensor Cores on NVIDIA hardware with compute capability >= 7.5 (Volta).",
+        help=(
+            "If set will pad the sequence to a multiple of the provided value. This is especially useful to enable the"
+            " use of Tensor Cores on NVIDIA hardware with compute capability >= 7.5 (Volta)."
+        ),
     )
     parser.add_argument(
         "--adam_beta1",
@@ -360,6 +363,10 @@ def main():
     # We now keep distinct sets of args, for a cleaner separation of concerns.
     args = parse_args()
 
+    # Sending telemetry. Tracking the example usage helps us better allocate resources to maintain them. The
+    # information sent is the one passed as arguments along with your Python/PyTorch versions.
+    send_example_telemetry("run_wav2vec2_pretraining_no_trainer", args)
+
     # Initialize the accelerator. We will let the accelerator handle device placement for us in this example.
     accelerator = Accelerator()
     logger.info(accelerator.state, main_process_only=False)
@@ -440,7 +447,7 @@ def main():
     # only normalized-inputs-training is supported
     if not feature_extractor.do_normalize:
         raise ValueError(
-            "Training is only supported for normalized inputs. " "Make sure ``feature_extractor.do_normalize == True``"
+            "Training is only supported for normalized inputs. Make sure ``feature_extractor.do_normalize == True``"
         )
 
     # set max & min audio length in number of samples
@@ -496,7 +503,8 @@ def main():
     # apply_spec_augment has to be True, mask_feature_prob has to be 0.0
     if not config.do_stable_layer_norm or config.feat_extract_norm != "layer":
         raise ValueError(
-            "PreTraining is only supported for ``config.do_stable_layer_norm=True`` and ``config.feat_extract_norm='layer'"
+            "PreTraining is only supported for ``config.do_stable_layer_norm=True`` and"
+            " ``config.feat_extract_norm='layer'"
         )
 
     # initialize random model
@@ -615,7 +623,7 @@ def main():
                     lr_scheduler.step()
                 elif accelerator.is_local_main_process:
                     progress_bar.write(
-                        "Gradients have overflown - skipping update step... " f"Updating gradient scale to {scale}..."
+                        f"Gradients have overflown - skipping update step... Updating gradient scale to {scale}..."
                     )
 
                 # update gumbel temperature
