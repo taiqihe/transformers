@@ -3,7 +3,7 @@
 # 2. run `make deps_table_update``
 deps = {
     "Pillow": "Pillow",
-    "accelerate": "accelerate>=0.9.0",
+    "accelerate": "accelerate>=0.10.0",
     "black": "black~=22.0,>=22.3",
     "codecarbon": "codecarbon==1.2.0",
     "cookiecutter": "cookiecutter==1.7.3",
@@ -61,6 +61,7 @@ deps = {
     "starlette": "starlette",
     "tensorflow-cpu": "tensorflow-cpu>=2.3",
     "tensorflow": "tensorflow>=2.3",
+    "tensorflow-text": "tensorflow-text",
     "tf2onnx": "tf2onnx",
     "timeout-decorator": "timeout-decorator",
     "timm": "timm",
