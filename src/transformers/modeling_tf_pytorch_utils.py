@@ -21,7 +21,7 @@ import re
 
 import numpy
 
-from .utils import ExplicitEnum, expand_dims, is_numpy_array, is_torch_tensor, logging, reshape, squeeze
+from .utils import ExplicitEnum, expand_dims, is_numpy_array, is_torch_tensor, logging, reshape, squeeze, tensor_size
 from .utils import transpose as transpose_func
 
 
@@ -216,7 +216,13 @@ def load_pytorch_state_dict_in_tf2_model(
     tf_model, pt_state_dict, tf_inputs=None, allow_missing_keys=False, output_loading_info=False
 ):
     """Load a pytorch state_dict in a TF 2.0 model."""
-    from tensorflow.python.keras import backend as K
+    import tensorflow as tf
+    from packaging.version import parse
+
+    if parse(tf.__version__) >= parse("2.11.0"):
+        from keras import backend as K
+    else:
+        from tensorflow.python.keras import backend as K
 
     if tf_inputs is None:
         tf_inputs = tf_model.dummy_inputs
@@ -273,7 +279,7 @@ def load_pytorch_state_dict_in_tf2_model(
 
         array = apply_transpose(transpose, pt_state_dict[name], symbolic_weight.shape)
 
-        tf_loaded_numel += array.size
+        tf_loaded_numel += tensor_size(array)
 
         weight_value_tuples.append((symbolic_weight, array))
         all_pytorch_weights.discard(name)

@@ -30,25 +30,24 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Union
 import h5py
 import numpy as np
 import tensorflow as tf
-from tensorflow.python.keras import backend as K
-from tensorflow.python.keras.engine import data_adapter
-from tensorflow.python.keras.engine.keras_tensor import KerasTensor
-from tensorflow.python.keras.saving import hdf5_format
+from packaging.version import parse
 
 from huggingface_hub import Repository, list_repo_files
-from keras.saving.hdf5_format import save_attributes_to_hdf5_group
 from transformers.utils.hub import convert_file_size_to_int, get_checkpoint_shard_files
 
 from . import DataCollatorWithPadding, DefaultDataCollator
 from .activations_tf import get_tf_activation
 from .configuration_utils import PretrainedConfig
 from .dynamic_module_utils import custom_object_save
-from .generation_tf_utils import TFGenerationMixin
+from .generation import TFGenerationMixin
 from .tf_utils import shape_list
 from .utils import (
     DUMMY_INPUTS,
+    SAFE_WEIGHTS_INDEX_NAME,
+    SAFE_WEIGHTS_NAME,
     TF2_WEIGHTS_INDEX_NAME,
     TF2_WEIGHTS_NAME,
+    TF_WEIGHTS_NAME,
     WEIGHTS_INDEX_NAME,
     WEIGHTS_NAME,
     ModelOutput,
@@ -59,11 +58,29 @@ from .utils import (
     has_file,
     is_offline_mode,
     is_remote_url,
+    is_safetensors_available,
     logging,
     requires_backends,
     working_or_temp_dir,
 )
 
+
+if parse(tf.__version__) >= parse("2.11.0"):
+    from keras import backend as K
+    from keras.engine import data_adapter
+    from keras.engine.keras_tensor import KerasTensor
+    from keras.saving.legacy import hdf5_format
+else:
+    from tensorflow.python.keras import backend as K
+    from tensorflow.python.keras.engine import data_adapter
+    from tensorflow.python.keras.engine.keras_tensor import KerasTensor
+    from tensorflow.python.keras.saving import hdf5_format
+
+
+if is_safetensors_available():
+    from safetensors import safe_open
+    from safetensors.tensorflow import load_file as safe_load_file
+    from safetensors.tensorflow import save_file as safe_save_file
 
 if TYPE_CHECKING:
     from . import PreTrainedTokenizerBase
@@ -86,7 +103,11 @@ TFModelInputType = Union[
 
 
 def dummy_loss(y_true, y_pred):
-    return tf.reduce_mean(y_pred)
+    if y_pred.shape.rank <= 1:
+        return y_pred
+    else:
+        reduction_axes = list(range(1, y_pred.shape.rank))
+        return tf.reduce_mean(y_pred, axis=reduction_axes)
 
 
 class TFModelUtilsMixin:
@@ -565,10 +586,10 @@ def input_processing(func, config, **kwargs):
 
     cast_output = dict()
     for key, val in output.items():
-        if isinstance(val, tf.Tensor) and val.dtype == tf.int32:
-            cast_output[key] = tf.cast(val, tf.int64)
-        elif isinstance(val, np.ndarray) and val.dtype == np.int32:
-            cast_output[key] = val.astype(np.int64)
+        if isinstance(val, tf.Tensor) and val.dtype == tf.int64:
+            cast_output[key] = tf.cast(val, tf.int32)
+        elif isinstance(val, np.ndarray) and val.dtype == np.int64:
+            cast_output[key] = val.astype(np.int32)
         else:
             cast_output[key] = val
 
@@ -610,6 +631,14 @@ def dtype_byte_size(dtype):
         raise ValueError(f"`dtype` is not a valid dtype: {dtype}.")
     bit_size = int(bit_search.groups()[0])
     return bit_size // 8
+
+
+def format_weight_name(name, _prefix=None):
+    if "model." not in name and len(name.split("/")) > 1:
+        name = "/".join(name.split("/")[1:])
+    if _prefix is not None:
+        name = _prefix + "/" + name
+    return name
 
 
 def tf_shard_checkpoint(weights, max_shard_size="10GB"):
@@ -849,6 +878,17 @@ def load_tf_weights(model, resolved_archive_file, ignore_mismatched_sizes=False,
         Three lists, one for the missing layers, another one for the unexpected layers, and a last one for the
         mismatched layers.
     """
+    if resolved_archive_file.endswith(".safetensors"):
+        load_function = load_tf_weights_from_safetensors
+    else:
+        load_function = load_tf_weights_from_h5
+
+    return load_function(
+        model, resolved_archive_file, ignore_mismatched_sizes=ignore_mismatched_sizes, _prefix=_prefix
+    )
+
+
+def load_tf_weights_from_h5(model, resolved_archive_file, ignore_mismatched_sizes=False, _prefix=None):
     missing_layers = []
     unexpected_layers = []
     mismatched_layers = []
@@ -952,6 +992,47 @@ def load_tf_weights(model, resolved_archive_file, ignore_mismatched_sizes=False,
     return missing_layers, unexpected_layers, mismatched_layers
 
 
+def load_tf_weights_from_safetensors(model, resolved_archive_file, ignore_mismatched_sizes=False, _prefix=None):
+    # Read the safetensors file
+    state_dict = safe_load_file(resolved_archive_file)
+
+    weight_value_tuples = []
+    mismatched_layers = []
+
+    weight_names = [format_weight_name(w.name, _prefix=_prefix) for w in model.weights]
+    loaded_weight_names = list(state_dict.keys())
+
+    # Find the missing layers from the high level list of layers
+    missing_layers = list(set(weight_names) - set(loaded_weight_names))
+    # Find the unexpected layers from the high level list of layers
+    unexpected_layers = list(set(loaded_weight_names) - set(weight_names))
+
+    weight_value_tuples = []
+    for weight in model.weights:
+        weight_name = format_weight_name(weight.name, _prefix=_prefix)
+        if weight_name in state_dict:
+            weight_value = state_dict[weight_name]
+            # Check if the shape of the current weight and the one from the H5 file are different
+            if K.int_shape(weight) != weight_value.shape:
+                # If yes we reshape the weight from the H5 file accordingly to the current weight
+                # If the two shapes are not compatible we raise an issue
+                try:
+                    weight_value = tf.reshape(weight_value, K.int_shape(weight))
+                except ValueError as e:
+                    if ignore_mismatched_sizes:
+                        mismatched_layers.append((weight_name, weight_value.shape, K.int_shape(weight)))
+                        continue
+                    else:
+                        raise e
+
+            weight_value_tuples.append((weight, weight_value))
+
+    # Load all the weights
+    K.batch_set_value(weight_value_tuples)
+
+    return missing_layers, unexpected_layers, mismatched_layers
+
+
 def init_copy_embeddings(old_embeddings, new_num_tokens):
     r"""
     This function aims to reduce the embeddings in case new_num_tokens < old_num_tokens or to pad with -1 in case
@@ -1035,7 +1116,7 @@ class TFPreTrainedModel(tf.keras.Model, TFModelUtilsMixin, TFGenerationMixin, Pu
             `Dict[str, tf.Tensor]`: The dummy inputs.
         """
         return {
-            "input_ids": tf.constant(DUMMY_INPUTS),
+            "input_ids": tf.constant(DUMMY_INPUTS, dtype=tf.int32),
         }
 
     @property
@@ -1075,12 +1156,25 @@ class TFPreTrainedModel(tf.keras.Model, TFModelUtilsMixin, TFGenerationMixin, Pu
         """
         return cls(config, **kwargs)
 
+    def eager_serving(self, inputs):
+        """
+        Method used for serving the model. Intended not to be compiled with a tf.function decorator so that we can use
+        it to generate multiple signatures later.
+
+        Args:
+            inputs (`Dict[str, tf.Tensor]`):
+                The input of the saved model as a dictionary of tensors.
+        """
+        output = self.call(inputs)
+
+        return self.serving_output(output)
+
     @tf.function(
         input_signature=[
             {
-                "input_ids": tf.TensorSpec((None, None), tf.int64, name="input_ids"),
-                "attention_mask": tf.TensorSpec((None, None), tf.int64, name="attention_mask"),
-                "token_type_ids": tf.TensorSpec((None, None), tf.int64, name="token_type_ids"),
+                "input_ids": tf.TensorSpec((None, None), tf.int32, name="input_ids"),
+                "attention_mask": tf.TensorSpec((None, None), tf.int32, name="attention_mask"),
+                "token_type_ids": tf.TensorSpec((None, None), tf.int32, name="token_type_ids"),
             }
         ]
     )
@@ -1096,7 +1190,7 @@ class TFPreTrainedModel(tf.keras.Model, TFModelUtilsMixin, TFGenerationMixin, Pu
 
         return self.serving_output(output)
 
-    def serving_output(output):
+    def serving_output(self, output):
         """
         Prepare the output of the saved model. Each model must implement this function.
 
@@ -2118,6 +2212,7 @@ class TFPreTrainedModel(tf.keras.Model, TFModelUtilsMixin, TFGenerationMixin, Pu
         signatures=None,
         max_shard_size: Union[int, str] = "10GB",
         create_pr: bool = False,
+        safe_serialization: bool = False,
         **kwargs
     ):
         """
@@ -2152,6 +2247,8 @@ class TFPreTrainedModel(tf.keras.Model, TFModelUtilsMixin, TFGenerationMixin, Pu
 
             create_pr (`bool`, *optional*, defaults to `False`):
                 Whether or not to create a PR with the uploaded files or directly commit.
+            safe_serialization (`bool`, *optional*, defaults to `False`):
+                Whether to save the model using `safetensors` or the traditional PyTorch way (that uses `pickle`).
 
             kwargs:
                 Additional key word arguments passed along to the [`~utils.PushToHubMixin.push_to_hub`] method.
@@ -2170,7 +2267,17 @@ class TFPreTrainedModel(tf.keras.Model, TFModelUtilsMixin, TFGenerationMixin, Pu
 
         if saved_model:
             if signatures is None:
-                signatures = self.serving
+                if any(spec.dtype == tf.int32 for spec in self.serving.input_signature[0].values()):
+                    int64_spec = {
+                        key: tf.TensorSpec(
+                            shape=spec.shape, dtype=tf.int64 if spec.dtype == tf.int32 else spec.dtype, name=spec.name
+                        )
+                        for key, spec in self.serving.input_signature[0].items()
+                    }
+                    int64_serving = tf.function(self.eager_serving, input_signature=[int64_spec])
+                    signatures = {"serving_default": self.serving, "int64_serving": int64_serving}
+                else:
+                    signatures = self.serving
             saved_model_dir = os.path.join(save_directory, "saved_model", str(version))
             self.save(saved_model_dir, include_optimizer=False, signatures=signatures)
             logger.info(f"Saved model created in {saved_model_dir}")
@@ -2186,7 +2293,8 @@ class TFPreTrainedModel(tf.keras.Model, TFModelUtilsMixin, TFGenerationMixin, Pu
         self.config.save_pretrained(save_directory)
 
         # If we save using the predefined names, we can load using `from_pretrained`
-        output_model_file = os.path.join(save_directory, TF2_WEIGHTS_NAME)
+        weights_name = SAFE_WEIGHTS_NAME if safe_serialization else TF2_WEIGHTS_NAME
+        output_model_file = os.path.join(save_directory, weights_name)
 
         shards, index = tf_shard_checkpoint(self.weights, max_shard_size)
 
@@ -2195,15 +2303,20 @@ class TFPreTrainedModel(tf.keras.Model, TFModelUtilsMixin, TFGenerationMixin, Pu
             full_filename = os.path.join(save_directory, filename)
             # If we have a shard file that is not going to be replaced, we delete it, but only from the main process
             # in distributed settings to avoid race conditions.
+            weights_no_suffix = weights_name.replace(".bin", "").replace(".safetensors", "")
             if (
-                filename.startswith(TF2_WEIGHTS_NAME[:-4])
+                filename.startswith(weights_no_suffix)
                 and os.path.isfile(full_filename)
                 and filename not in shards.keys()
             ):
                 os.remove(full_filename)
 
         if index is None:
-            self.save_weights(output_model_file)
+            if safe_serialization:
+                state_dict = {format_weight_name(w.name): w.value() for w in self.weights}
+                safe_save_file(state_dict, output_model_file, metadata={"format": "tf"})
+            else:
+                self.save_weights(output_model_file)
             logger.info(f"Model weights saved in {output_model_file}")
         else:
             save_index_file = os.path.join(save_directory, TF2_WEIGHTS_INDEX_NAME)
@@ -2222,7 +2335,6 @@ class TFPreTrainedModel(tf.keras.Model, TFModelUtilsMixin, TFGenerationMixin, Pu
                     for layer in sorted(shard, key=lambda x: x.name):
                         if "model." in layer.name or len(layer.name.split("/")) == 1:
                             layer_name = layer.name
-                            print(layer_name)
                         else:
                             layer_name = "/".join(layer.name.split("/")[1:])
                         param_dset = shard_file.create_dataset(
@@ -2230,7 +2342,7 @@ class TFPreTrainedModel(tf.keras.Model, TFModelUtilsMixin, TFGenerationMixin, Pu
                         )
                         param_dset[:] = layer.numpy()
                         layers.append(layer_name.encode("utf8"))
-                    save_attributes_to_hdf5_group(shard_file, "layer_names", layers)
+                    hdf5_format.save_attributes_to_hdf5_group(shard_file, "layer_names", layers)
 
         if push_to_hub:
             self._upload_modified_files(
@@ -2281,7 +2393,7 @@ class TFPreTrainedModel(tf.keras.Model, TFModelUtilsMixin, TFGenerationMixin, Pu
                       save directory.
                     - The model is loaded by supplying a local directory as `pretrained_model_name_or_path` and a
                       configuration JSON file named *config.json* is found in the directory.
-            from_pt: (`bool`, *optional*, defaults to `False`):
+            from_pt (`bool`, *optional*, defaults to `False`):
                 Load the model weights from a PyTorch state_dict save file (see docstring of
                 `pretrained_model_name_or_path` argument).
             ignore_mismatched_sizes (`bool`, *optional*, defaults to `False`):
@@ -2420,7 +2532,7 @@ class TFPreTrainedModel(tf.keras.Model, TFModelUtilsMixin, TFGenerationMixin, Pu
         if pretrained_model_name_or_path is not None:
             pretrained_model_name_or_path = str(pretrained_model_name_or_path)
             is_local = os.path.isdir(pretrained_model_name_or_path)
-            if os.path.isdir(pretrained_model_name_or_path):
+            if is_local:
                 if from_pt and os.path.isfile(os.path.join(pretrained_model_name_or_path, WEIGHTS_NAME)):
                     # Load from a PyTorch checkpoint in priority if from_pt
                     archive_file = os.path.join(pretrained_model_name_or_path, WEIGHTS_NAME)
@@ -2428,6 +2540,18 @@ class TFPreTrainedModel(tf.keras.Model, TFModelUtilsMixin, TFGenerationMixin, Pu
                     # Load from a sharded PyTorch checkpoint
                     archive_file = os.path.join(pretrained_model_name_or_path, WEIGHTS_INDEX_NAME)
                     is_sharded = True
+                elif is_safetensors_available() and os.path.isfile(
+                    os.path.join(pretrained_model_name_or_path, SAFE_WEIGHTS_NAME)
+                ):
+                    # Load from a safetensors checkpoint
+                    archive_file = os.path.join(pretrained_model_name_or_path, SAFE_WEIGHTS_NAME)
+                elif is_safetensors_available() and os.path.isfile(
+                    os.path.join(pretrained_model_name_or_path, SAFE_WEIGHTS_INDEX_NAME)
+                ):
+                    # Load from a sharded safetensors checkpoint
+                    archive_file = os.path.join(pretrained_model_name_or_path, SAFE_WEIGHTS_INDEX_NAME)
+                    is_sharded = True
+                    raise NotImplementedError("Support for sharded checkpoints using safetensors is coming soon!")
                 elif os.path.isfile(os.path.join(pretrained_model_name_or_path, TF2_WEIGHTS_NAME)):
                     # Load from a TF 2.0 checkpoint
                     archive_file = os.path.join(pretrained_model_name_or_path, TF2_WEIGHTS_NAME)
@@ -2436,7 +2560,9 @@ class TFPreTrainedModel(tf.keras.Model, TFModelUtilsMixin, TFGenerationMixin, Pu
                     archive_file = os.path.join(pretrained_model_name_or_path, TF2_WEIGHTS_INDEX_NAME)
                     is_sharded = True
                 # At this stage we don't have a weight file so we will raise an error.
-                elif os.path.join(pretrained_model_name_or_path, WEIGHTS_NAME):
+                elif os.path.isfile(os.path.join(pretrained_model_name_or_path, WEIGHTS_NAME)) or os.path.isfile(
+                    os.path.join(pretrained_model_name_or_path, WEIGHTS_INDEX_NAME)
+                ):
                     raise EnvironmentError(
                         f"Error no file named {TF2_WEIGHTS_NAME} found in directory {pretrained_model_name_or_path} "
                         "but there is a file for PyTorch weights. Use `from_pt=True` to load this model from those "
@@ -2458,7 +2584,12 @@ class TFPreTrainedModel(tf.keras.Model, TFModelUtilsMixin, TFGenerationMixin, Pu
                 resolved_archive_file = download_url(pretrained_model_name_or_path)
             else:
                 # set correct filename
-                filename = WEIGHTS_NAME if from_pt else TF2_WEIGHTS_NAME
+                if from_pt:
+                    filename = WEIGHTS_NAME
+                elif is_safetensors_available():
+                    filename = SAFE_WEIGHTS_NAME
+                else:
+                    filename = TF2_WEIGHTS_NAME
 
                 try:
                     # Load from URL or cache if already cached
@@ -2477,12 +2608,35 @@ class TFPreTrainedModel(tf.keras.Model, TFModelUtilsMixin, TFGenerationMixin, Pu
                     )
                     resolved_archive_file = cached_file(pretrained_model_name_or_path, filename, **cached_file_kwargs)
 
-                    # Since we set _raise_exceptions_for_missing_entries=False, we don't get an expection but a None
+                    # Since we set _raise_exceptions_for_missing_entries=False, we don't get an exception but a None
                     # result when internet is up, the repo and revision exist, but the file does not.
+                    if resolved_archive_file is None and filename == SAFE_WEIGHTS_NAME:
+                        # Maybe the checkpoint is sharded, we try to grab the index name in this case.
+                        resolved_archive_file = cached_file(
+                            pretrained_model_name_or_path, SAFE_WEIGHTS_INDEX_NAME, **cached_file_kwargs
+                        )
+                        if resolved_archive_file is not None:
+                            is_sharded = True
+                            raise NotImplementedError(
+                                "Support for sharded checkpoints using safetensors is coming soon!"
+                            )
+                        else:
+                            # This repo has no safetensors file of any kind, we switch to TensorFlow.
+                            filename = TF2_WEIGHTS_NAME
+                            resolved_archive_file = cached_file(
+                                pretrained_model_name_or_path, TF2_WEIGHTS_NAME, **cached_file_kwargs
+                            )
                     if resolved_archive_file is None and filename == TF2_WEIGHTS_NAME:
                         # Maybe the checkpoint is sharded, we try to grab the index name in this case.
                         resolved_archive_file = cached_file(
                             pretrained_model_name_or_path, TF2_WEIGHTS_INDEX_NAME, **cached_file_kwargs
+                        )
+                        if resolved_archive_file is not None:
+                            is_sharded = True
+                    if resolved_archive_file is None and filename == WEIGHTS_NAME:
+                        # Maybe the checkpoint is sharded, we try to grab the index name in this case.
+                        resolved_archive_file = cached_file(
+                            pretrained_model_name_or_path, WEIGHTS_INDEX_NAME, **cached_file_kwargs
                         )
                         if resolved_archive_file is not None:
                             is_sharded = True
@@ -2502,8 +2656,8 @@ class TFPreTrainedModel(tf.keras.Model, TFModelUtilsMixin, TFGenerationMixin, Pu
                             )
                         else:
                             raise EnvironmentError(
-                                f"{pretrained_model_name_or_path} does not appear to have a file named"
-                                f" {TF2_WEIGHTS_NAME} or {WEIGHTS_NAME}."
+                                f"{pretrained_model_name_or_path} does not appear to have a file named {WEIGHTS_NAME},"
+                                f" {TF2_WEIGHTS_NAME} or {TF_WEIGHTS_NAME}"
                             )
 
                 except EnvironmentError:
@@ -2517,11 +2671,12 @@ class TFPreTrainedModel(tf.keras.Model, TFModelUtilsMixin, TFGenerationMixin, Pu
                         f"Can't load the model for '{pretrained_model_name_or_path}'. If you were trying to load it"
                         " from 'https://huggingface.co/models', make sure you don't have a local directory with the"
                         f" same name. Otherwise, make sure '{pretrained_model_name_or_path}' is the correct path to a"
-                        f" directory containing a file named {TF2_WEIGHTS_NAME} or {WEIGHTS_NAME}."
+                        f" directory containing a file named {WEIGHTS_NAME}, {TF2_WEIGHTS_NAME} or {TF_WEIGHTS_NAME}"
                     )
             if is_local:
                 logger.info(f"loading weights file {archive_file}")
                 resolved_archive_file = archive_file
+                filename = resolved_archive_file.split(os.path.sep)[-1]
             else:
                 logger.info(f"loading weights file {filename} from cache at {resolved_archive_file}")
         else:
@@ -2544,6 +2699,17 @@ class TFPreTrainedModel(tf.keras.Model, TFModelUtilsMixin, TFGenerationMixin, Pu
                 _commit_hash=commit_hash,
             )
 
+        safetensors_from_pt = False
+        if filename == SAFE_WEIGHTS_NAME:
+            with safe_open(resolved_archive_file, framework="tf") as f:
+                safetensors_metadata = f.metadata()
+            if safetensors_metadata is None or safetensors_metadata.get("format") not in ["pt", "tf", "flax"]:
+                raise OSError(
+                    f"The safetensors archive passed at {resolved_archive_file} does not contain the valid metadata."
+                    " Make sure you save your model with the `save_pretrained` method."
+                )
+            safetensors_from_pt = safetensors_metadata.get("format") == "pt"
+
         config.name_or_path = pretrained_model_name_or_path
 
         # composed models, *e.g.* TFRag, require special treatment when it comes to loading
@@ -2560,6 +2726,14 @@ class TFPreTrainedModel(tf.keras.Model, TFModelUtilsMixin, TFGenerationMixin, Pu
             # Load from a PyTorch checkpoint
             return load_pytorch_checkpoint_in_tf2_model(
                 model, resolved_archive_file, allow_missing_keys=True, output_loading_info=output_loading_info
+            )
+        elif safetensors_from_pt:
+            from .modeling_tf_pytorch_utils import load_pytorch_state_dict_in_tf2_model
+
+            state_dict = safe_load_file(resolved_archive_file)
+            # Load from a PyTorch checkpoint
+            return load_pytorch_state_dict_in_tf2_model(
+                model, state_dict, allow_missing_keys=True, output_loading_info=output_loading_info
             )
 
         # we might need to extend the variable scope for composite models
@@ -2689,7 +2863,7 @@ class TFPreTrainedModel(tf.keras.Model, TFModelUtilsMixin, TFGenerationMixin, Pu
             commit_message (`str`, *optional*):
                 Message to commit while pushing. Will default to `"Upload model"`.
             private (`bool`, *optional*):
-                Whether or not the repository created should be private (requires a paying subscription).
+                Whether or not the repository created should be private.
             use_auth_token (`bool` or `str`, *optional*):
                 The token to use as HTTP bearer authorization for remote files. If `True`, will use the token generated
                 when running `huggingface-cli login` (stored in `~/.huggingface`). Will default to `True` if `repo_url`
