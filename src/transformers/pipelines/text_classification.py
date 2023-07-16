@@ -102,7 +102,7 @@ class TextClassificationPipeline(Pipeline):
             postprocess_params["_legacy"] = False
         elif return_all_scores is not None:
             warnings.warn(
-                "`return_all_scores` is now deprecated,  if want a similar funcionality use `top_k=None` instead of"
+                "`return_all_scores` is now deprecated,  if want a similar functionality use `top_k=None` instead of"
                 " `return_all_scores=True` or `top_k=1` instead of `return_all_scores=False`.",
                 UserWarning,
             )
@@ -125,7 +125,7 @@ class TextClassificationPipeline(Pipeline):
         Args:
             args (`str` or `List[str]` or `Dict[str]`, or `List[Dict[str]]`):
                 One or several texts to classify. In order to use text pairs for your classification, you can send a
-                dictionnary containing `{"text", "text_pair"}` keys, or a list of those.
+                dictionary containing `{"text", "text_pair"}` keys, or a list of those.
             top_k (`int`, *optional*, defaults to `1`):
                 How many results to return.
             function_to_apply (`str`, *optional*, defaults to `"default"`):
@@ -174,7 +174,7 @@ class TextClassificationPipeline(Pipeline):
             # This is likely an invalid usage of the pipeline attempting to pass text pairs.
             raise ValueError(
                 "The pipeline received invalid inputs, if you are trying to send text pairs, you can try to send a"
-                ' dictionnary `{"text": "My text", "text_pair": "My pair"}` in order to send a text pair.'
+                ' dictionary `{"text": "My text", "text_pair": "My pair"}` in order to send a text pair.'
             )
         return self.tokenizer(inputs, return_tensors=return_tensors, **tokenizer_kwargs)
 

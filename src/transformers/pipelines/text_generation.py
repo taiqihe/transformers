@@ -1,8 +1,7 @@
 import enum
 import warnings
 
-from transformers import MODEL_FOR_CAUSAL_LM_MAPPING, TF_MODEL_FOR_CAUSAL_LM_MAPPING
-
+from .. import MODEL_FOR_CAUSAL_LM_MAPPING, TF_MODEL_FOR_CAUSAL_LM_MAPPING
 from ..utils import add_end_docstrings, is_tf_available
 from .base import PIPELINE_INIT_ARGS, Pipeline
 
@@ -97,7 +96,7 @@ class TextGenerationPipeline(Pipeline):
         prefix=None,
         handle_long_generation=None,
         stop_sequence=None,
-        **generate_kwargs
+        **generate_kwargs,
     ):
         preprocess_params = {}
         if prefix is not None:
@@ -106,17 +105,8 @@ class TextGenerationPipeline(Pipeline):
             prefix_inputs = self.tokenizer(
                 prefix, padding=False, add_special_tokens=False, return_tensors=self.framework
             )
-            prefix_length = prefix_inputs["input_ids"].shape[-1]
+            generate_kwargs["prefix_length"] = prefix_inputs["input_ids"].shape[-1]
 
-            if "max_new_tokens" in generate_kwargs:
-                pass
-            elif "max_length" in generate_kwargs:
-                generate_kwargs["max_length"] += prefix_length
-            else:
-                generate_kwargs["max_length"] = self.model.config.max_length + prefix_length
-
-            if "min_length" in generate_kwargs:
-                generate_kwargs["min_length"] += prefix_length
         if handle_long_generation is not None:
             if handle_long_generation not in {"hole"}:
                 raise ValueError(
@@ -130,8 +120,14 @@ class TextGenerationPipeline(Pipeline):
 
         postprocess_params = {}
         if return_full_text is not None and return_type is None:
+            if return_text is not None:
+                raise ValueError("`return_text` is mutually exclusive with `return_full_text`")
+            if return_tensors is not None:
+                raise ValueError("`return_full_text` is mutually exclusive with `return_tensors`")
             return_type = ReturnType.FULL_TEXT if return_full_text else ReturnType.NEW_TEXT
         if return_tensors is not None and return_type is None:
+            if return_text is not None:
+                raise ValueError("`return_text` is mutually exclusive with `return_tensors`")
             return_type = ReturnType.TENSORS
         if return_type is not None:
             postprocess_params["return_type"] = return_type
@@ -168,11 +164,12 @@ class TextGenerationPipeline(Pipeline):
             args (`str` or `List[str]`):
                 One or several prompts (or one list of prompts) to complete.
             return_tensors (`bool`, *optional*, defaults to `False`):
-                Whether or not to include the tensors of predictions (as token indices) in the outputs.
+                Whether or not to return the tensors of predictions (as token indices) in the outputs. If set to
+                `True`, the decoded text is not returned.
             return_text (`bool`, *optional*, defaults to `True`):
-                Whether or not to include the decoded texts in the outputs.
+                Whether or not to return the decoded texts in the outputs.
             return_full_text (`bool`, *optional*, defaults to `True`):
-                If set to `False` only added text is returned, otherwise the full text is returned Only meaningful if
+                If set to `False` only added text is returned, otherwise the full text is returned. Only meaningful if
                 *return_text* is set to True.
             clean_up_tokenization_spaces (`bool`, *optional*, defaults to `False`):
                 Whether or not to clean up the potential extra spaces in the text output.
@@ -193,7 +190,8 @@ class TextGenerationPipeline(Pipeline):
                 corresponding to your framework [here](./model#generative-models)).
 
         Return:
-            A list or a list of list of `dict`: Each result comes as a dictionary with the following keys:
+            A list or a list of list of `dict`: Returns one of the following dictionaries (cannot return a combination
+            of both `generated_text` and `generated_token_ids`):
 
             - **generated_text** (`str`, present when `return_text=True`) -- The generated text.
             - **generated_token_ids** (`torch.Tensor` or `tf.Tensor`, present when `return_tensors=True`) -- The token
@@ -240,6 +238,25 @@ class TextGenerationPipeline(Pipeline):
         else:
             in_b = input_ids.shape[0]
         prompt_text = model_inputs.pop("prompt_text")
+
+        # If there is a prefix, we may need to adjust the generation length. Do so without permanently modifying
+        # generate_kwargs, as some of the parameterization may come from the initialization of the pipeline.
+        prefix_length = generate_kwargs.pop("prefix_length", 0)
+        if prefix_length > 0:
+            has_max_new_tokens = "max_new_tokens" in generate_kwargs or (
+                "generation_config" in generate_kwargs
+                and generate_kwargs["generation_config"].max_new_tokens is not None
+            )
+            if not has_max_new_tokens:
+                generate_kwargs["max_length"] = generate_kwargs.get("max_length") or self.model.config.max_length
+                generate_kwargs["max_length"] += prefix_length
+            has_min_new_tokens = "min_new_tokens" in generate_kwargs or (
+                "generation_config" in generate_kwargs
+                and generate_kwargs["generation_config"].min_new_tokens is not None
+            )
+            if not has_min_new_tokens and "min_length" in generate_kwargs:
+                generate_kwargs["min_length"] += prefix_length
+
         # BS x SL
         generated_sequence = self.model.generate(input_ids=input_ids, attention_mask=attention_mask, **generate_kwargs)
         out_b = generated_sequence.shape[0]
